@@ -1,0 +1,5 @@
+build-agent/
+.cxx/
+.gradle/
+*.apk
+.DS_Store
