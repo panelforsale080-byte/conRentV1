@@ -36,6 +36,9 @@
 
 uint64_t il2cpp_base = 0;
 static uint64_t g_il2cpp_size = 0;
+static bool g_initialized = false;
+static bool g_DoLog = true;
+static std::string g_runtimeLibraryName;
 
 static void refreshLibraryBounds(const std::string &libName)
 {
@@ -72,6 +75,52 @@ static void refreshLibraryBounds(const std::string &libName)
     }
 }
 
+struct SoMap
+{
+    uint64_t start = 0;
+    uint64_t end = 0;
+    uint64_t fileOff = 0;
+    std::string name;
+};
+
+static bool findContainingMap(uint64_t addr, SoMap &out)
+{
+    FILE *maps = std::fopen("/proc/self/maps", "r");
+    if (!maps)
+        return false;
+
+    char line[1024];
+    bool found = false;
+    while (std::fgets(line, sizeof(line), maps))
+    {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        uint64_t fileOff = 0;
+        char perms[8] = {};
+        if (std::sscanf(line, "%lx-%lx %7s %lx", &start, &end, perms, &fileOff) != 4)
+            continue;
+        if (addr < start || addr >= end)
+            continue;
+        if (!std::strchr(perms, 'x'))
+            continue;
+        const char *path = std::strchr(line, '/');
+        if (!path || !std::strstr(path, ".so"))
+            continue;
+        std::string full(path);
+        while (!full.empty() && (full.back() == '\n' || full.back() == '\r' || full.back() == ' '))
+            full.pop_back();
+        const auto slash = full.find_last_of('/');
+        out.start = start;
+        out.end = end;
+        out.fileOff = fileOff;
+        out.name = (slash == std::string::npos) ? full : full.substr(slash + 1);
+        found = true;
+        break;
+    }
+    std::fclose(maps);
+    return found;
+}
+
 static uint64_t methodAbsoluteAddress(MethodInfo *method)
 {
     if (!method)
@@ -83,23 +132,29 @@ static uint64_t methodAbsoluteAddress(MethodInfo *method)
     return addr;
 }
 
-static uint64_t methodRva(uint64_t addr)
+static void methodOffsetInfo(uint64_t addr, uint64_t &offset, uint64_t &moduleRva, std::string &libName)
 {
-    if (!addr)
-        return 0;
-    if (il2cpp_base && addr >= il2cpp_base)
+    offset = 0;
+    moduleRva = 0;
+    libName = g_runtimeLibraryName;
+
+    SoMap map;
+    if (addr && findContainingMap(addr, map))
     {
-        const uint64_t rva = addr - il2cpp_base;
-        if (!g_il2cpp_size || rva < g_il2cpp_size + 0x10000ULL)
-            return rva;
+        moduleRva = (addr - map.start) + map.fileOff;
+        const uint64_t bias = map.start - map.fileOff;
+        offset = (addr >= bias) ? (addr - bias) : moduleRva;
+        if (!map.name.empty())
+            libName = map.name;
+        return;
     }
-    if (addr < 0x08000000ULL)
-        return addr;
-    return 0;
+
+    if (addr && il2cpp_base && addr >= il2cpp_base)
+    {
+        offset = addr - il2cpp_base;
+        moduleRva = offset;
+    }
 }
-static bool g_initialized = false;
-static bool g_DoLog = true;
-static std::string g_runtimeLibraryName;
 
 static void *resolveIl2cppSymbol(void *handle, const char *name)
 {
@@ -457,11 +512,15 @@ std::string dump_method_cs(Il2CppClass *klass)
     while (auto method = il2cpp_class_get_methods(klass, &iter))
     {
         const uint64_t absAddr = methodAbsoluteAddress(method);
-        const uint64_t rva = methodRva(absAddr);
-        outPut << "\n\t// Offset: 0x" << std::hex << rva;
+        uint64_t offset = 0;
+        uint64_t moduleRva = 0;
+        std::string libName;
+        methodOffsetInfo(absAddr, offset, moduleRva, libName);
+        outPut << "\n\t// Offset: 0x" << std::hex << offset;
+        outPut << "\n\t// ModuleRVA: 0x" << std::hex << moduleRva;
         outPut << "\n\t// Address: 0x" << std::hex << absAddr;
-        if (!g_runtimeLibraryName.empty())
-            outPut << "\n\t// Lib: " << g_runtimeLibraryName;
+        if (!libName.empty())
+            outPut << "\n\t// Lib: " << libName;
         outPut << "\n\t";
         outPut << Il2cpp::GetMethodSignature(method) << " { }\n";
     }
@@ -677,6 +736,11 @@ std::string dump_type_cs(Il2CppType *type)
             outPut << ", " << extends[i];
         }
     }
+    
+    uint32_t instanceSize = 0;
+    if (il2cpp_class_instance_size)
+        instanceSize = il2cpp_class_instance_size(klass);
+    outPut << "\n// InstanceSize: 0x" << std::hex << instanceSize << std::dec;
     
     outPut << "\n{";
     outPut << dump_field_cs(klass);

@@ -3,3 +3,5 @@ build-agent/
 .gradle/
 *.apk
 .DS_Store
+obj/
+libs/
