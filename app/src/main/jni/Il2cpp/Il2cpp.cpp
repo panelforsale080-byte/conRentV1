@@ -35,6 +35,7 @@
 #undef DO_API
 
 uint64_t il2cpp_base = 0;
+static uint64_t g_il2cpp_size = 0;
 
 static void refreshLibraryBounds(const std::string &libName)
 {
@@ -99,7 +100,6 @@ static uint64_t methodRva(uint64_t addr)
 static bool g_initialized = false;
 static bool g_DoLog = true;
 static std::string g_runtimeLibraryName;
-static uint64_t g_il2cpp_size = 0;
 
 static void *resolveIl2cppSymbol(void *handle, const char *name)
 {
