@@ -32,13 +32,13 @@ jobs:
             NDK_LIBS_OUT=libs \
             NDK_OUT=obj \
             -j"$(nproc)"
-          test -f libs/arm64-v8a/libTool.so
-          file libs/arm64-v8a/libTool.so
-          ls -lh libs/arm64-v8a/libTool.so
+          test -f app/src/main/libs/arm64-v8a/libTool.so
+          file app/src/main/libs/arm64-v8a/libTool.so
+          ls -lh app/src/main/libs/arm64-v8a/libTool.so
 
       - name: Upload libTool.so
         uses: actions/upload-artifact@v4
         with:
           name: libTool-arm64-v8a
-          path: libs/arm64-v8a/libTool.so
+          path: app/src/main/libs/arm64-v8a/libTool.so
           if-no-files-found: error
