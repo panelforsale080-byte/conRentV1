@@ -150,6 +150,7 @@ namespace Il2cpp
     
     bool Dump(ProgressCallback callback = nullptr);
     bool Dump(const std::string& outputPath, ProgressCallback callback = nullptr);
+    void SetDumpLogPath(const std::string& path);
     std::string GetDumpPath();
     bool IsDumperReady();
     bool IsRuntimeReady();

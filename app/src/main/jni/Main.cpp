@@ -534,6 +534,9 @@ static bool canWriteDumpDir(const std::string &dir)
     return true;
 }
 
+static std::string g_dumpPackage;
+static std::string g_dumpDirReason;
+
 static std::string chooseDumpFilesDir()
 {
     char packageName[256] = {};
@@ -543,6 +546,7 @@ static std::string chooseDumpFilesDir()
         std::fread(packageName, 1, sizeof(packageName) - 1, fp);
         std::fclose(fp);
     }
+    g_dumpPackage = packageName;
 
     std::vector<std::string> candidates;
     if (packageName[0])
@@ -558,8 +562,12 @@ static std::string chooseDumpFilesDir()
     for (const auto &dir : candidates)
     {
         if (canWriteDumpDir(dir))
+        {
+            g_dumpDirReason = "writable " + dir;
             return dir;
+        }
     }
+    g_dumpDirReason = "no writable directory";
     return {};
 }
 
@@ -575,10 +583,8 @@ static void appendDumpLog(const std::string &logPath, const char *msg)
     std::fclose(fp);
 }
 
-static void RunStartupDump()
+static void RunStartupDump(const std::string &filesDir, const std::string &logPath)
 {
-    const std::string filesDir = chooseDumpFilesDir();
-    const std::string logPath = filesDir.empty() ? std::string() : filesDir + "/log.txt";
     if (filesDir.empty())
     {
         appendDumpLog(logPath, "ERROR: no writable files directory");
@@ -587,6 +593,7 @@ static void RunStartupDump()
 
     const std::string dumpPath = filesDir + "/dump.cs";
     appendDumpLog(logPath, ("dump path=" + dumpPath).c_str());
+    Il2cpp::SetDumpLogPath(logPath);
 
     try
     {
@@ -683,14 +690,37 @@ void *hack_thread(void *)
     LOGI("pthread created");
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    while (Il2cpp::GetRuntimeLibraryName().empty())
+    const std::string filesDir = chooseDumpFilesDir();
+    const std::string logPath = filesDir.empty() ? std::string() : filesDir + "/log.txt";
+    Il2cpp::SetDumpLogPath(logPath);
+    appendDumpLog(logPath, "hack_thread start");
+    appendDumpLog(logPath, ("package=" + g_dumpPackage).c_str());
+    appendDumpLog(logPath, ("files dir=" + (filesDir.empty() ? std::string("(none)") : filesDir)).c_str());
+    appendDumpLog(logPath, ("dir reason=" + g_dumpDirReason).c_str());
+
+    for (int i = 0; i < 180 && Il2cpp::GetRuntimeLibraryName().empty(); ++i)
+    {
+        if (i == 0 || i % 5 == 0)
+            appendDumpLog(logPath, ("waiting for IL2CPP library " + std::to_string(i) + "s").c_str());
         sleep(1);
+    }
+
+    const std::string runtimeLib = Il2cpp::GetRuntimeLibraryName();
+    appendDumpLog(logPath, ("runtime lib=" + (runtimeLib.empty() ? std::string("(none)") : runtimeLib)).c_str());
     Il2cpp::Init();
     for (int i = 0; i < 90 && !Il2cpp::IsRuntimeReady(); ++i)
+    {
+        if (i == 0 || i % 5 == 0)
+            appendDumpLog(logPath, ("waiting for runtime ready " + std::to_string(i) + "s").c_str());
         sleep(1);
+    }
+    appendDumpLog(logPath, Il2cpp::IsRuntimeReady() ? "runtime ready=1" : "runtime ready=0");
     if (Il2cpp::EnsureAttached())
-        RunStartupDump();
+        RunStartupDump(filesDir, logPath);
+    else
+        appendDumpLog(logPath, "ERROR: EnsureAttached failed; skip dump");
 
+    appendDumpLog(logPath, "starting LibTool UI");
     LOGINT(useJava);
     if (!useJava)
         initModMenu((void *)draw_thread, (void *)on_init);

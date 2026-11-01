@@ -27,6 +27,8 @@
 #include "il2cpp-class.h"
 
 #include "xdl/include/xdl.h"
+#include <android/log.h>
+#include <cstdarg>
 
 #define DO_API(r, n, p) r(*n) p
 
@@ -80,45 +82,85 @@ struct SoMap
     uint64_t start = 0;
     uint64_t end = 0;
     uint64_t fileOff = 0;
+    bool exec = false;
     std::string name;
 };
 
-static bool findContainingMap(uint64_t addr, SoMap &out)
+static std::vector<SoMap> g_mapsCache;
+static std::string g_dumpLogPath;
+
+static void dumpLog(const char *fmt, ...)
 {
+    char message[1024];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    __android_log_print(ANDROID_LOG_INFO, "Il2cppDump", "%s", message);
+    if (g_dumpLogPath.empty())
+        return;
+
+    FILE *fp = std::fopen(g_dumpLogPath.c_str(), "a");
+    if (!fp)
+        return;
+    std::fprintf(fp, "%s\n", message);
+    std::fclose(fp);
+}
+
+static void refreshMapsCache()
+{
+    g_mapsCache.clear();
     FILE *maps = std::fopen("/proc/self/maps", "r");
     if (!maps)
-        return false;
+        return;
 
     char line[1024];
-    bool found = false;
     while (std::fgets(line, sizeof(line), maps))
     {
-        uint64_t start = 0;
-        uint64_t end = 0;
-        uint64_t fileOff = 0;
+        SoMap map;
         char perms[8] = {};
-        if (std::sscanf(line, "%lx-%lx %7s %lx", &start, &end, perms, &fileOff) != 4)
+        if (std::sscanf(line, "%lx-%lx %7s %lx", &map.start, &map.end, perms, &map.fileOff) != 4)
             continue;
-        if (addr < start || addr >= end)
-            continue;
-        if (!std::strchr(perms, 'x'))
-            continue;
+        map.exec = std::strchr(perms, 'x') != nullptr;
         const char *path = std::strchr(line, '/');
-        if (!path || !std::strstr(path, ".so"))
-            continue;
-        std::string full(path);
-        while (!full.empty() && (full.back() == '\n' || full.back() == '\r' || full.back() == ' '))
-            full.pop_back();
-        const auto slash = full.find_last_of('/');
-        out.start = start;
-        out.end = end;
-        out.fileOff = fileOff;
-        out.name = (slash == std::string::npos) ? full : full.substr(slash + 1);
-        found = true;
-        break;
+        if (path)
+        {
+            std::string full(path);
+            while (!full.empty() && (full.back() == '\n' || full.back() == '\r' || full.back() == ' '))
+                full.pop_back();
+            const auto slash = full.find_last_of('/');
+            map.name = (slash == std::string::npos) ? full : full.substr(slash + 1);
+        }
+        g_mapsCache.push_back(map);
     }
     std::fclose(maps);
-    return found;
+}
+
+static bool findContainingMap(uint64_t addr, SoMap &out)
+{
+    if (g_mapsCache.empty())
+        refreshMapsCache();
+
+    const SoMap *best = nullptr;
+    for (const auto &map : g_mapsCache)
+    {
+        if (addr < map.start || addr >= map.end)
+            continue;
+        if (!best)
+        {
+            best = &map;
+            continue;
+        }
+        if (map.exec && !best->exec)
+            best = &map;
+        else if (map.exec == best->exec && !map.name.empty() && best->name.empty())
+            best = &map;
+    }
+    if (!best)
+        return false;
+    out = *best;
+    return true;
 }
 
 static uint64_t methodAbsoluteAddress(MethodInfo *method)
@@ -646,7 +688,11 @@ std::string dump_field_cs(Il2CppClass *klass)
 std::string dump_type_cs(Il2CppType *type)
 {
     std::stringstream outPut;
+    if (!type || !il2cpp_class_from_type)
+        return "\n// skipped invalid type\n";
     auto *klass = il2cpp_class_from_type(type);
+    if (!klass)
+        return "\n// skipped null class\n";
     
     outPut << "\n// Namespace: " << il2cpp_class_get_namespace(klass) << "\n";
     auto flags = il2cpp_class_get_flags(klass);
@@ -717,7 +763,7 @@ std::string dump_type_cs(Il2CppType *type)
     if (!is_valuetype && !is_enum && parent)
     {
         auto parent_type = il2cpp_class_get_type(parent);
-        if (parent_type->type != IL2CPP_TYPE_OBJECT)
+        if (parent_type && parent_type->type != IL2CPP_TYPE_OBJECT)
         {
             extends.emplace_back(Il2cpp::GetCsTypeName(parent));
         }
@@ -775,6 +821,11 @@ namespace Il2cpp
     std::string GetRuntimeLibraryName()
     {
         return detectRuntimeLibraryName();
+    }
+
+    void SetDumpLogPath(const std::string &path)
+    {
+        g_dumpLogPath = path;
     }
 
     void Init()
@@ -1437,13 +1488,19 @@ namespace Il2cpp
     }
 
     bool Dump(ProgressCallback callback) {
+        return Dump(GetDumpPath(), callback);
+    }
+
+    bool Dump(const std::string& outputPath, ProgressCallback callback) {
+        dumpLog("Dump() start path=%s init=%d lib=%s", outputPath.c_str(), g_initialized ? 1 : 0,
+                g_runtimeLibraryName.c_str());
         if (!g_initialized) {
-            LOGE("Il2Cpp not initialized");
+            dumpLog("ERROR: Il2Cpp not initialized");
             return false;
         }
 
         if (!il2cpp_domain_get || !il2cpp_domain_get_assemblies) {
-            LOGE("Required IL2CPP functions not available");
+            dumpLog("ERROR: required IL2CPP functions not available");
             return false;
         }
 
@@ -1452,10 +1509,13 @@ namespace Il2cpp
             il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
         }
         refreshLibraryBounds(g_runtimeLibraryName);
+        refreshMapsCache();
+        dumpLog("maps=%zu base=0x%llx size=0x%llx", g_mapsCache.size(),
+                (unsigned long long)il2cpp_base, (unsigned long long)g_il2cpp_size);
 
         auto domain = il2cpp_domain_get();
         if (!domain) {
-            LOGE("Failed to get IL2CPP domain");
+            dumpLog("ERROR: Failed to get IL2CPP domain");
             return false;
         }
 
@@ -1466,11 +1526,10 @@ namespace Il2cpp
         size_t size = 0;
         auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
         if (!assemblies || size == 0) {
-            LOGE("No assemblies found");
+            dumpLog("ERROR: No assemblies found");
             return false;
         }
-
-        std::string outputPath = GetDumpPath();
+        dumpLog("assemblies=%zu", size);
         
         std::stringstream headerOutput;
         headerOutput << "// IL2CPP Dumped\n";
@@ -1486,61 +1545,63 @@ namespace Il2cpp
             imageOutput << "// Image " << i << ": " << il2cpp_image_get_name(image) << "\n";
         }
 
-        std::vector<std::string> outputs;
         int totalClasses = 0;
-        
         if (il2cpp_image_get_class) {
             for (size_t i = 0; i < size; ++i) {
                 Il2CppImage* image = il2cpp_assembly_get_image(assemblies[i]);
-                totalClasses += il2cpp_image_get_class_count(image);
+                if (image && il2cpp_image_get_class_count)
+                    totalClasses += il2cpp_image_get_class_count(image);
             }
         }
-
-        int processedClasses = 0;
-        
-        if (il2cpp_image_get_class) {
-            for (size_t i = 0; i < size; ++i) {
-                Il2CppImage* image = il2cpp_assembly_get_image(assemblies[i]);
-                std::string imageName = il2cpp_image_get_name(image);
-                
-                if (callback) {
-                    DumpProgress progress;
-                    progress.currentAssembly = imageName;
-                    progress.totalAssemblies = size;
-                    progress.currentAssemblyIndex = i;
-                    progress.totalClasses = totalClasses;
-                    progress.currentClassIndex = processedClasses;
-                    progress.progress = totalClasses > 0 ? (float)processedClasses / (float)totalClasses : 0.0f;
-                    callback(progress);
-                }
-                
-                uint32_t classCount = il2cpp_image_get_class_count(image);
-                for (uint32_t j = 0; j < classCount; ++j) {
-                    Il2CppClass* klass = il2cpp_image_get_class(image, j);
-                    const Il2CppType* type = (const Il2CppType*)il2cpp_class_get_type((Il2CppClass*)klass);
-                    std::string out = dump_type_cs((Il2CppType*)type);
-                    outputs.push_back(out);
-                    processedClasses++;
-                }
-            }
-        }
+        dumpLog("classes=%d writing %s", totalClasses, outputPath.c_str());
 
         std::ofstream outStream(outputPath);
         if (!outStream.is_open()) {
-            LOGE("Failed to open output file: %s", outputPath.c_str());
+            dumpLog("ERROR: Failed to open output file: %s", outputPath.c_str());
             return false;
         }
 
         outStream << headerOutput.str();
         outStream << imageOutput.str();
-        
-        auto count = outputs.size();
-        for (size_t i = 0; i < count; ++i) {
-            outStream << outputs[i];
+        outStream.flush();
+
+        int processedClasses = 0;
+        if (il2cpp_image_get_class) {
+            for (size_t i = 0; i < size; ++i) {
+                Il2CppImage* image = il2cpp_assembly_get_image(assemblies[i]);
+                const char *imageName = image && il2cpp_image_get_name ? il2cpp_image_get_name(image) : "?";
+                const uint32_t classCount = (image && il2cpp_image_get_class_count) ? il2cpp_image_get_class_count(image) : 0;
+                dumpLog("image %zu/%zu %s classes=%u", i + 1, size, imageName, classCount);
+
+                if (callback) {
+                    DumpProgress progress;
+                    progress.currentAssembly = imageName ? imageName : "";
+                    progress.totalAssemblies = size;
+                    progress.currentAssemblyIndex = static_cast<int>(i);
+                    progress.totalClasses = totalClasses;
+                    progress.currentClassIndex = processedClasses;
+                    progress.progress = totalClasses > 0 ? (float)processedClasses / (float)totalClasses : 0.0f;
+                    callback(progress);
+                }
+
+                for (uint32_t j = 0; j < classCount; ++j) {
+                    Il2CppClass* klass = il2cpp_image_get_class(image, j);
+                    if (!klass || !il2cpp_class_get_type) {
+                        processedClasses++;
+                        continue;
+                    }
+                    const Il2CppType* type = (const Il2CppType*)il2cpp_class_get_type((Il2CppClass*)klass);
+                    outStream << dump_type_cs((Il2CppType*)type);
+                    processedClasses++;
+                    if ((processedClasses % 200) == 0)
+                        outStream.flush();
+                }
+                outStream.flush();
+            }
         }
-        
+
         outStream.close();
-        
+
         if (callback) {
             DumpProgress progress;
             progress.progress = 1.0f;
@@ -1548,123 +1609,8 @@ namespace Il2cpp
             progress.totalClasses = totalClasses;
             callback(progress);
         }
-        
-        LOGI("Dump completed: %s", outputPath.c_str());
-        return true;
-    }
 
-    bool Dump(const std::string& outputPath, ProgressCallback callback) {
-        if (!g_initialized) {
-            LOGE("Il2Cpp not initialized");
-            return false;
-        }
-
-        if (!il2cpp_domain_get || !il2cpp_domain_get_assemblies) {
-            LOGE("Required IL2CPP functions not available");
-            return false;
-        }
-
-        Dl_info dlInfo;
-        if (dladdr((void*)il2cpp_domain_get, &dlInfo)) {
-            il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
-        }
-        refreshLibraryBounds(g_runtimeLibraryName);
-
-        auto domain = il2cpp_domain_get();
-        if (!domain) {
-            LOGE("Failed to get IL2CPP domain");
-            return false;
-        }
-
-        if (il2cpp_thread_attach) {
-            il2cpp_thread_attach(domain);
-        }
-
-        size_t size = 0;
-        auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
-        if (!assemblies || size == 0) {
-            LOGE("No assemblies found");
-            return false;
-        }
-
-        std::stringstream headerOutput;
-        headerOutput << "// IL2CPP Dumper\n";
-        headerOutput << "// Package: " << GetPackageName() << "\n";
-        headerOutput << "// Library: " << (g_runtimeLibraryName.empty() ? "unknown" : g_runtimeLibraryName) << "\n";
-        headerOutput << "// Base: 0x" << std::hex << il2cpp_base << std::dec << "\n";
-        headerOutput << "// Size: 0x" << std::hex << g_il2cpp_size << std::dec << "\n";
-        headerOutput << "// Date: " << __DATE__ << " " << __TIME__ << "\n\n";
-
-        std::stringstream imageOutput;
-        for (size_t i = 0; i < size; ++i) {
-            Il2CppImage* image = il2cpp_assembly_get_image(assemblies[i]);
-            imageOutput << "// Image " << i << ": " << il2cpp_image_get_name(image) << "\n";
-        }
-
-        std::vector<std::string> outputs;
-        int totalClasses = 0;
-        
-        if (il2cpp_image_get_class) {
-            for (size_t i = 0; i < size; ++i) {
-                Il2CppImage* image = il2cpp_assembly_get_image(assemblies[i]);
-                totalClasses += il2cpp_image_get_class_count(image);
-            }
-        }
-
-        int processedClasses = 0;
-        
-        if (il2cpp_image_get_class) {
-            for (size_t i = 0; i < size; ++i) {
-                Il2CppImage* image = il2cpp_assembly_get_image(assemblies[i]);
-                std::string imageName = il2cpp_image_get_name(image);
-                
-                if (callback) {
-                    DumpProgress progress;
-                    progress.currentAssembly = imageName;
-                    progress.totalAssemblies = size;
-                    progress.currentAssemblyIndex = i;
-                    progress.totalClasses = totalClasses;
-                    progress.currentClassIndex = processedClasses;
-                    progress.progress = totalClasses > 0 ? (float)processedClasses / (float)totalClasses : 0.0f;
-                    callback(progress);
-                }
-                
-                uint32_t classCount = il2cpp_image_get_class_count(image);
-                for (uint32_t j = 0; j < classCount; ++j) {
-                    Il2CppClass* klass = il2cpp_image_get_class(image, j);
-                    const Il2CppType* type = (const Il2CppType*)il2cpp_class_get_type((Il2CppClass*)klass);
-                    std::string out = dump_type_cs((Il2CppType*)type);
-                    outputs.push_back(out);
-                    processedClasses++;
-                }
-            }
-        }
-
-        std::ofstream outStream(outputPath);
-        if (!outStream.is_open()) {
-            LOGE("Failed to open output file: %s", outputPath.c_str());
-            return false;
-        }
-
-        outStream << headerOutput.str();
-        outStream << imageOutput.str();
-        
-        auto count = outputs.size();
-        for (size_t i = 0; i < count; ++i) {
-            outStream << outputs[i];
-        }
-        
-        outStream.close();
-        
-        if (callback) {
-            DumpProgress progress;
-            progress.progress = 1.0f;
-            progress.currentClassIndex = totalClasses;
-            progress.totalClasses = totalClasses;
-            callback(progress);
-        }
-        
-        LOGI("Dump completed: %s", outputPath.c_str());
+        dumpLog("SUCCESS dump.cs written classes=%d path=%s", processedClasses, outputPath.c_str());
         return true;
     }
 
