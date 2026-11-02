@@ -790,12 +790,15 @@ extern "C"
         return env->NewStringUTF(Tool::GetWindowRect().c_str());
     }
 }
+// When built as ptrace inject payload (libtoolv2 CI), skip auto hack_thread — it crashes
+// the target if loaded via remote dlopen. Full agent still loads via normal game inject.
+#ifndef LIBTOOL_INJECT_PAYLOAD
 __attribute__((constructor)) void lib_main()
 {
-    // Create a new thread so it does not block the main thread, means the game would not freeze
     pthread_t ptid;
     pthread_create(&ptid, nullptr, hack_thread, nullptr);
 }
+#endif
 
 JavaVM *g_vm = nullptr;
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, [[maybe_unused]] void *reserved)
