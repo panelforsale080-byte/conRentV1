@@ -9,6 +9,7 @@
 #include "Includes/obfuscate.h"  // for make_obfuscator, OBFUSCATE
 #include "Menu/ImGui.h"
 #include "Tool/Keyboard.h"
+#include "Tool/EspTab.h"
 #include "Tool/ProcessTab.h"
 #include "Tool/SoMonitor.h"
 #include "Tool/Tool.h"
@@ -157,6 +158,10 @@ void draw_thread()
     }
     int i = 0;
     auto drawList = ImGui::GetBackgroundDrawList();
+    {
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        EspTab::DrawOverlay(drawList, display.x, display.y);
+    }
 
     for (auto &v : HookerData::visited)
     {
@@ -319,6 +324,11 @@ void draw_thread()
         if (ImGui::BeginTabItem("So Monitor"))
         {
             SoMonitor::Draw();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("ESP"))
+        {
+            EspTab::Draw();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Dumper"))

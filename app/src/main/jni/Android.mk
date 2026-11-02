@@ -53,6 +53,7 @@ LOCAL_SRC_FILES := \
     Tool/Keyboard.cpp \
     Tool/ProcessTab.cpp \
     Tool/SoMonitor.cpp \
+    Tool/EspTab.cpp \
     Tool/Tool.cpp \
     Tool/Util.cpp \
     Tool/Patcher.cpp \
