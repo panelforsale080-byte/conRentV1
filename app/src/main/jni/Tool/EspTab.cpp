@@ -14,7 +14,6 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -235,111 +234,6 @@ namespace
         std::ofstream log((dir + "/log.txt").c_str(), std::ios::app);
         if (log)
             log << "\n===== ESP RESOLVE =====\n" << text << "\n";
-    }
-
-    bool resolveOffsets();
-    bool readIntPtrDict(uintptr_t dict, std::vector<std::pair<int, uintptr_t>> &out);
-    ImVec2 worldToScreen(const EspVec3 &pos, float screenWidth, float screenHeight);
-
-    void writeAtomic(const std::string &path, const std::string &text)
-    {
-        const std::string tmp = path + ".tmp";
-        {
-            std::ofstream out(tmp.c_str(), std::ios::trunc);
-            if (!out)
-                return;
-            out << text;
-        }
-        std::rename(tmp.c_str(), path.c_str());
-    }
-
-    void publishLiveSnapshot(float screenWidth, float screenHeight)
-    {
-        if (!Il2cpp::IsRuntimeReady() || !resolveOffsets() || !g_off.battleManager)
-            return;
-
-        if (g_off.battleBridge && g_off.getBStartBattle)
-        {
-            auto started = reinterpret_cast<bool (*)(void *)>(g_off.getBStartBattle);
-            if (!started(reinterpret_cast<void *>(g_off.battleBridge)))
-                return;
-        }
-
-        const uintptr_t localPlayer = *reinterpret_cast<uintptr_t *>(g_off.battleManager + g_off.localPlayerShow);
-        if (!localPlayer)
-            return;
-
-        const EspVec3 selfPos = *reinterpret_cast<EspVec3 *>(localPlayer + g_off.lastPosition);
-        const ImVec2 selfScreen = worldToScreen(selfPos, screenWidth, screenHeight);
-        const bool proj = selfScreen.x >= 0.f && selfScreen.y >= 0.f;
-
-        struct Row
-        {
-            float x, yFeet, yHead, wx, wz;
-            std::string name;
-            int meters;
-            int hp;
-            int hpMax;
-            int kind;
-        };
-        std::vector<Row> rows;
-
-        auto addEntity = [&](uintptr_t v, int kind, const char *nameOverride) {
-            if (!v)
-                return;
-            if (*reinterpret_cast<bool *>(v + g_off.entityDeath))
-                return;
-            if (*reinterpret_cast<bool *>(v + g_off.sameCamp))
-                return;
-            const int id = *reinterpret_cast<int *>(v + g_off.entityId);
-            const int hp = *reinterpret_cast<int *>(v + g_off.hp);
-            const int hpMax = *reinterpret_cast<int *>(v + g_off.hpMax);
-            const EspVec3 pos = *reinterpret_cast<EspVec3 *>(v + g_off.lastPosition);
-            const ImVec2 root = worldToScreen(pos, screenWidth, screenHeight);
-            const float boxHeight = std::fabs(screenHeight / (kind ? 6.8f : 6.5f));
-            const int meters = static_cast<int>(EspVec3::Distance(selfPos, pos));
-            std::string name = nameOverride ? nameOverride : ("ID " + std::to_string(id));
-            rows.push_back({root.x, root.y, root.y - boxHeight, pos.x, pos.z, name, meters, hp, hpMax, kind});
-        };
-
-        std::vector<std::pair<int, uintptr_t>> players;
-        readIntPtrDict(*reinterpret_cast<uintptr_t *>(g_off.battleManager + g_off.dicPlayerShow), players);
-        for (const auto &kv : players)
-            addEntity(kv.second, 0, nullptr);
-
-        std::vector<std::pair<int, uintptr_t>> monsters;
-        readIntPtrDict(*reinterpret_cast<uintptr_t *>(g_off.battleManager + g_off.dicMonsterShow), monsters);
-        for (const auto &kv : monsters)
-        {
-            if (!kv.second)
-                continue;
-            const int id = *reinterpret_cast<int *>(kv.second + g_off.entityId);
-            if (!isMonsterId(id))
-                continue;
-            addEntity(kv.second, 1, monsterName(id));
-        }
-
-        std::ostringstream os;
-        os << "OK|src=libtool|pid=" << getpid()
-           << "|cam=0|lp=" << selfPos.x << "," << selfPos.z
-           << "|count=" << rows.size() << "|proj=" << (proj ? 1 : 0) << "|";
-        for (size_t i = 0; i < rows.size(); ++i)
-        {
-            if (i)
-                os << ";";
-            if (proj)
-                os << rows[i].x << "," << rows[i].yFeet << "," << rows[i].yHead << ","
-                   << rows[i].name << "," << rows[i].meters << ","
-                   << rows[i].hp << "," << rows[i].hpMax << "," << (rows[i].kind ? "M" : "P");
-            else
-                os << rows[i].wx << "," << rows[i].wz << ","
-                   << rows[i].name << "," << rows[i].meters << ","
-                   << rows[i].hp << "," << rows[i].hpMax << "," << (rows[i].kind ? "M" : "P");
-        }
-
-        const std::string dir = chooseResolveDir();
-        if (!dir.empty())
-            writeAtomic(dir + "/esp_live.txt", os.str());
     }
 
     struct ClassHit
@@ -730,7 +624,6 @@ void EspTab::Draw()
     }
     if (!g_resolvePath.empty())
         ImGui::TextDisabled("%s", g_resolvePath.c_str());
-    ImGui::TextDisabled("Live overlay file: <files>/esp_live.txt");
     ImGui::BeginChild("esp_resolve_log", ImVec2(-1.f, 220.f), true);
     ImGui::TextUnformatted(g_resolveLog.empty() ? "Tap Resolve classes to fill this log." : g_resolveLog.c_str());
     ImGui::EndChild();
@@ -760,11 +653,10 @@ void EspTab::Draw()
 
 void EspTab::DrawOverlay(ImDrawList *draw, float screenWidth, float screenHeight)
 {
-    try
-    {
-    publishLiveSnapshot(screenWidth, screenHeight);
     if (!draw)
         return;
+    try
+    {
     const bool any = g_feature.box || g_feature.line || g_feature.health || g_feature.name || g_feature.distance ||
                      g_feature.spell || g_feature.skillCd || g_feature.spellCd || g_feature.monsterBox ||
                      g_feature.monsterName || g_feature.monsterHealth;
