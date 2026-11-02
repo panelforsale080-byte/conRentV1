@@ -3,11 +3,16 @@
 #include "Il2cpp/Il2cpp.h"
 #include "Il2cpp/il2cpp-class.h"
 #include "Includes/Logger.h"
+#include "Tool/Tool.h"
 #include "imgui/imgui.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -77,6 +82,31 @@ namespace
     };
 
     EspOffsets g_off;
+    std::string g_resolveLog;
+    std::string g_resolvePath;
+
+    struct DumpFallback
+    {
+        uintptr_t localPlayerShow = 0x48;
+        uintptr_t dicPlayerShow = 0x60;
+        uintptr_t dicMonsterShow = 0x68;
+        uintptr_t lastPosition = 0x3F4;
+        uintptr_t entityId = 0x18C;
+        uintptr_t entityDeath = 0xC5;
+        uintptr_t sameCamp = 0x2A9;
+        uintptr_t hp = 0x1A4;
+        uintptr_t hpMax = 0x1A8;
+        uintptr_t ownSkillComp = 0x108;
+        uintptr_t skillComp = 0x4F0;
+        uintptr_t coolDownComp = 0xB0;
+        uintptr_t dicCoolInfo = 0x18;
+        uintptr_t skillList = 0x10;
+        uintptr_t skillUseTypeList = 0x18;
+        uintptr_t tranId = 0x88;
+        uintptr_t summonSkillId = 0x984;
+    };
+
+    const DumpFallback kDump;
 
     const int kMonsterIds[] = {2002, 2003, 2004, 2005, 2006, 2008, 2009, 2011, 2012, 2013, 2056, 2059, 2072};
 
@@ -148,12 +178,122 @@ namespace
         return field->getStaticValue<uintptr_t>();
     }
 
+    void hexPtr(std::ostringstream &os, uintptr_t value)
+    {
+        os << "0x" << std::hex << value << std::dec;
+    }
+
+    std::string chooseResolveDir()
+    {
+        char packageName[256] = {};
+        FILE *fp = std::fopen("/proc/self/cmdline", "r");
+        if (fp)
+        {
+            std::fread(packageName, 1, sizeof(packageName) - 1, fp);
+            std::fclose(fp);
+        }
+
+        std::vector<std::string> candidates;
+        if (packageName[0])
+        {
+            candidates.push_back(std::string("/storage/emulated/0/Android/data/") + packageName + "/files");
+            candidates.push_back(std::string("/sdcard/Android/data/") + packageName + "/files");
+            candidates.push_back(std::string("/data/data/") + packageName + "/files");
+            candidates.push_back(std::string("/data/user/0/") + packageName + "/files");
+        }
+        candidates.push_back("/storage/emulated/0/Download");
+        candidates.push_back("/sdcard/Download");
+
+        for (const auto &dir : candidates)
+        {
+            const std::string probe = dir + "/.esp_write_probe";
+            FILE *out = std::fopen(probe.c_str(), "w");
+            if (!out)
+                continue;
+            std::fclose(out);
+            std::remove(probe.c_str());
+            return dir;
+        }
+        return {};
+    }
+
+    void writeResolveFiles(const std::string &text)
+    {
+        const std::string dir = chooseResolveDir();
+        if (dir.empty())
+        {
+            g_resolvePath.clear();
+            return;
+        }
+        g_resolvePath = dir + "/esp_resolve.txt";
+        {
+            std::ofstream out(g_resolvePath.c_str(), std::ios::trunc);
+            if (out)
+                out << text;
+        }
+        std::ofstream log((dir + "/log.txt").c_str(), std::ios::app);
+        if (log)
+            log << "\n===== ESP RESOLVE =====\n" << text << "\n";
+    }
+
+    struct ClassHit
+    {
+        const char *name;
+        Il2CppClass *klass;
+    };
+
+    void logClass(std::ostringstream &os, const ClassHit &hit)
+    {
+        os << "  " << hit.name << "  ";
+        if (!hit.klass)
+        {
+            os << "MISSING\n";
+            return;
+        }
+        os << "FOUND klass=";
+        hexPtr(os, reinterpret_cast<uintptr_t>(hit.klass));
+        os << " name=" << (hit.klass->getName() ? hit.klass->getName() : "?") << "\n";
+    }
+
+    void logMethod(std::ostringstream &os, const char *klass, const char *name, int args, uintptr_t ptr)
+    {
+        os << "  " << klass << "." << name << "(" << args << ")  ptr=";
+        hexPtr(os, ptr);
+        os << (ptr ? "  OK\n" : "  MISSING\n");
+    }
+
+    uintptr_t takeField(std::ostringstream &os, Il2CppClass *klass, const char *klassName, const char *name,
+                        uintptr_t dumpValue)
+    {
+        const uintptr_t resolved = fieldOff(klass, name);
+        const uintptr_t used = resolved ? resolved : dumpValue;
+        os << "  " << klassName << "." << name
+           << "  resolved=";
+        hexPtr(os, resolved);
+        os << "  dump=";
+        hexPtr(os, dumpValue);
+        os << "  used=";
+        hexPtr(os, used);
+        os << (resolved ? "  runtime\n" : "  dump-fallback\n");
+        return used;
+    }
+
+    void logStatic(std::ostringstream &os, const char *klass, const char *name, uintptr_t value)
+    {
+        os << "  " << klass << "." << name << "  ";
+        hexPtr(os, value);
+        os << (value ? "  OK\n" : "  NULL\n");
+    }
+
     bool resolveOffsets()
     {
-        if (g_off.ready)
+        if (g_off.ready && !g_resolveLog.empty())
             return true;
         if (!Il2cpp::IsRuntimeReady())
+        {
+            g_resolveLog = "ESP RESOLVE LOG\nruntime_ready=0\nready=0\nwhy=IL2CPP runtime is not ready\n";
             return false;
+        }
 
         auto *camera = findClass("UnityEngine.Camera");
         auto *battleData = findClass("BattleData");
@@ -179,42 +319,108 @@ namespace
         g_off.battleManager = staticFieldValue(battleManager, "Instance");
         g_off.logicBattleManager = staticFieldValue(logicBattle, "Instance");
 
-        if (auto v = fieldOff(battleManager, "m_LocalPlayerShow"))
-            g_off.localPlayerShow = v;
-        if (auto v = fieldOff(battleManager, "m_dicPlayerShow"))
-            g_off.dicPlayerShow = v;
-        if (auto v = fieldOff(battleManager, "m_dicMonsterShow"))
-            g_off.dicMonsterShow = v;
-        if (auto v = fieldOff(showEntity, "<LastPosition>k__BackingField"))
-            g_off.lastPosition = v;
-        if (auto v = fieldOff(showEntity, "m_ID"))
-            g_off.entityId = v;
-        if (auto v = fieldOff(showEntity, "m_bDeath"))
-            g_off.entityDeath = v;
-        if (auto v = fieldOff(showEntity, "m_bSameCampType"))
-            g_off.sameCamp = v;
-        if (auto v = fieldOff(showEntity, "m_Hp"))
-            g_off.hp = v;
-        if (auto v = fieldOff(showEntity, "m_HpMax"))
-            g_off.hpMax = v;
-        if (auto v = fieldOff(showEntity, "m_OwnSkillComp"))
-            g_off.ownSkillComp = v;
-        if (auto v = fieldOff(logicFighter, "m_SkillComp"))
-            g_off.skillComp = v;
-        if (auto v = fieldOff(logicSkill, "m_CoolDownComp"))
-            g_off.coolDownComp = v;
-        if (auto v = fieldOff(coolDownComp, "m_DicCoolInfo"))
-            g_off.dicCoolInfo = v;
-        if (auto v = fieldOff(ownSkill, "m_SkillList"))
-            g_off.skillList = v;
-        if (auto v = fieldOff(ownSkill, "skillUseTypeList"))
-            g_off.skillUseTypeList = v;
-        if (auto v = fieldOff(showSkill, "m_TranID"))
-            g_off.tranId = v;
-        if (auto v = fieldOff(showPlayer, "m_iSummonSkillId"))
-            g_off.summonSkillId = v;
+        std::ostringstream os;
+        os << "ESP RESOLVE LOG\n";
+        os << "source=same-process IL2CPP FindClass/getField/getMethod\n";
+        os << "runtime_ready=1\n";
+
+        os << "\nCLASSES\n";
+        const ClassHit classes[] = {
+            {"UnityEngine.Camera", camera},
+            {"BattleData", battleData},
+            {"BattleBridge", battleBridge},
+            {"BattleManager", battleManager},
+            {"ShowEntity", showEntity},
+            {"ShowPlayer", showPlayer},
+            {"LogicBattleManager", logicBattle},
+            {"Battle.LogicFighter", logicFighter},
+            {"Battle.LogicSkillComp", logicSkill},
+            {"Battle.CoolDownComp", coolDownComp},
+            {"Battle.CoolDownData", coolDownData},
+            {"Battle.ShowOwnSkillComp", ownSkill},
+            {"ShowSkillData", showSkill},
+        };
+        for (const auto &hit : classes)
+            logClass(os, hit);
+
+        os << "\nMETHODS (runtime pointers, not dump RVA)\n";
+        logMethod(os, "UnityEngine.Camera", "get_main", 0, g_off.cameraGetMain);
+        logMethod(os, "UnityEngine.Camera", "WorldToScreenPoint", 1, g_off.cameraWorldToScreen);
+        logMethod(os, "BattleBridge", "get_bStartBattle", 0, g_off.getBStartBattle);
+        logMethod(os, "LogicBattleManager", "GetPlayerLogic", 1, g_off.getPlayerLogic);
+        logMethod(os, "Battle.CoolDownData", "GetCoolTime", 0, g_off.getCoolTime);
+
+        os << "\nFIELDS (runtime offset, dump.cs fallback, value used)\n";
+        g_off.localPlayerShow = takeField(os, battleManager, "BattleManager", "m_LocalPlayerShow", kDump.localPlayerShow);
+        g_off.dicPlayerShow = takeField(os, battleManager, "BattleManager", "m_dicPlayerShow", kDump.dicPlayerShow);
+        g_off.dicMonsterShow = takeField(os, battleManager, "BattleManager", "m_dicMonsterShow", kDump.dicMonsterShow);
+        g_off.lastPosition = takeField(os, showEntity, "ShowEntity", "<LastPosition>k__BackingField", kDump.lastPosition);
+        g_off.entityId = takeField(os, showEntity, "ShowEntity", "m_ID", kDump.entityId);
+        g_off.entityDeath = takeField(os, showEntity, "ShowEntity", "m_bDeath", kDump.entityDeath);
+        g_off.sameCamp = takeField(os, showEntity, "ShowEntity", "m_bSameCampType", kDump.sameCamp);
+        g_off.hp = takeField(os, showEntity, "ShowEntity", "m_Hp", kDump.hp);
+        g_off.hpMax = takeField(os, showEntity, "ShowEntity", "m_HpMax", kDump.hpMax);
+        g_off.ownSkillComp = takeField(os, showEntity, "ShowEntity", "m_OwnSkillComp", kDump.ownSkillComp);
+        g_off.skillComp = takeField(os, logicFighter, "Battle.LogicFighter", "m_SkillComp", kDump.skillComp);
+        g_off.coolDownComp = takeField(os, logicSkill, "Battle.LogicSkillComp", "m_CoolDownComp", kDump.coolDownComp);
+        g_off.dicCoolInfo = takeField(os, coolDownComp, "Battle.CoolDownComp", "m_DicCoolInfo", kDump.dicCoolInfo);
+        g_off.skillList = takeField(os, ownSkill, "Battle.ShowOwnSkillComp", "m_SkillList", kDump.skillList);
+        g_off.skillUseTypeList =
+            takeField(os, ownSkill, "Battle.ShowOwnSkillComp", "skillUseTypeList", kDump.skillUseTypeList);
+        g_off.tranId = takeField(os, showSkill, "ShowSkillData", "m_TranID", kDump.tranId);
+        g_off.summonSkillId = takeField(os, showPlayer, "ShowPlayer", "m_iSummonSkillId", kDump.summonSkillId);
+
+        os << "\nSTATICS (live instance pointers)\n";
+        logStatic(os, "BattleData", "m_BattleBridge", g_off.battleBridge);
+        logStatic(os, "BattleManager", "Instance", g_off.battleManager);
+        logStatic(os, "LogicBattleManager", "Instance", g_off.logicBattleManager);
 
         g_off.ready = g_off.cameraGetMain && g_off.cameraWorldToScreen && g_off.battleManager;
+        os << "\nREADY=" << (g_off.ready ? "1" : "0") << "\n";
+        os << "why=";
+        if (g_off.ready)
+            os << "cameraGetMain + cameraWorldToScreen + BattleManager.Instance\n";
+        else
+        {
+            if (!g_off.cameraGetMain)
+                os << "missing Camera.get_main; ";
+            if (!g_off.cameraWorldToScreen)
+                os << "missing Camera.WorldToScreenPoint; ";
+            if (!g_off.battleManager)
+                os << "missing BattleManager.Instance; ";
+            os << "\n";
+        }
+
+        os << "\nWHY THIS WORKS\n";
+        os << "  1. Same-process IL2CPP: FindClass + getField + getMethod.\n";
+        os << "  2. Field offsets come from live metadata; dump.cs is fallback only.\n";
+        os << "  3. WorldToScreen uses Camera.get_main + WorldToScreenPoint.\n";
+        os << "  4. Players/monsters come from BattleManager dictionaries.\n";
+        os << "  5. Local player is BattleManager.m_LocalPlayerShow.\n";
+        os << "  6. Position is ShowEntity.<LastPosition>k__BackingField.\n";
+        os << "  7. Filter: skip m_bDeath and m_bSameCampType.\n";
+
+        os << "\nDUMP.CS FALLBACK TABLE\n";
+        os << "  BattleManager.m_LocalPlayerShow=0x48  dump.cs:684144\n";
+        os << "  BattleManager.m_dicPlayerShow=0x60    dump.cs:684147\n";
+        os << "  BattleManager.m_dicMonsterShow=0x68   dump.cs:684148\n";
+        os << "  ShowEntity.LastPosition=0x3F4         dump.cs:667913\n";
+        os << "  ShowEntity.m_ID=0x18C                 dump.cs:667783\n";
+        os << "  ShowEntity.m_bDeath=0xC5              dump.cs:667749\n";
+        os << "  ShowEntity.m_bSameCampType=0x2A9      dump.cs:667847\n";
+        os << "  ShowEntity.m_Hp=0x1A4                 dump.cs:667789\n";
+        os << "  ShowEntity.m_HpMax=0x1A8              dump.cs:667790\n";
+        os << "  ShowEntity.m_OwnSkillComp=0x108       dump.cs:667760\n";
+        os << "  LogicFighter.m_SkillComp=0x4F0        dump.cs:1638848\n";
+        os << "  LogicSkillComp.m_CoolDownComp=0xB0    dump.cs:1685984\n";
+        os << "  CoolDownComp.m_DicCoolInfo=0x18       dump.cs:1673978\n";
+        os << "  ShowOwnSkillComp.m_SkillList=0x10     dump.cs:1713414\n";
+        os << "  ShowSkillData.m_TranID=0x88           dump.cs:695037\n";
+        os << "  ShowPlayer.m_iSummonSkillId=0x984     dump.cs:673673\n";
+
+        g_resolveLog = os.str();
+        writeResolveFiles(g_resolveLog);
+        LOGI("ESP resolve ready=%d bm=0x%lx", (int)g_off.ready, (unsigned long)g_off.battleManager);
         return g_off.ready;
     }
 
@@ -388,10 +594,39 @@ void EspTab::Draw()
     if (ImGui::Button("Resolve classes"))
     {
         g_off.ready = false;
+        g_resolveLog.clear();
         resolveOffsets();
     }
     ImGui::SameLine();
     ImGui::Text(g_off.ready ? "resolved" : "not resolved");
+    if (g_resolveLog.empty() && Il2cpp::IsRuntimeReady())
+        resolveOffsets();
+
+    ImGui::SeparatorText("Resolve log");
+    if (ImGui::Button("Copy resolve log"))
+    {
+        if (!g_resolveLog.empty())
+        {
+            ImGui::SetClipboardText(g_resolveLog.c_str());
+            Tool::AddNotification("Success", "ESP resolve log copied", true, 2.0f);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save resolve file"))
+    {
+        if (g_resolveLog.empty())
+            resolveOffsets();
+        writeResolveFiles(g_resolveLog);
+        if (!g_resolvePath.empty())
+            Tool::AddNotification("Success", "Wrote " + g_resolvePath, true, 2.5f);
+        else
+            Tool::AddNotification("Failed", "Could not write resolve file", false, 2.5f);
+    }
+    if (!g_resolvePath.empty())
+        ImGui::TextDisabled("%s", g_resolvePath.c_str());
+    ImGui::BeginChild("esp_resolve_log", ImVec2(-1.f, 220.f), true);
+    ImGui::TextUnformatted(g_resolveLog.empty() ? "Tap Resolve classes to fill this log." : g_resolveLog.c_str());
+    ImGui::EndChild();
 
     ImGui::SeparatorText("Enemy");
     ImGui::Checkbox("Box", &g_feature.box);
