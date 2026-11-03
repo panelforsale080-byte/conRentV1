@@ -790,13 +790,26 @@ extern "C"
         return env->NewStringUTF(Tool::GetWindowRect().c_str());
     }
 }
-// When built as ptrace inject payload (libtoolv2 CI), skip auto hack_thread — it crashes
-// the target if loaded via remote dlopen. Full agent still loads via normal game inject.
+// Full APK / local load: start menu thread immediately.
 #ifndef LIBTOOL_INJECT_PAYLOAD
 __attribute__((constructor)) void lib_main()
 {
     pthread_t ptid;
     pthread_create(&ptid, nullptr, hack_thread, nullptr);
+}
+#else
+// External libloader inject: defer menu thread so Unity can finish boot (reduces SIGKILL).
+static void *delayed_hack_entry(void *)
+{
+    sleep(28);
+    return hack_thread(nullptr);
+}
+
+__attribute__((constructor)) void lib_inject_delayed()
+{
+    pthread_t ptid;
+    pthread_create(&ptid, nullptr, delayed_hack_entry, nullptr);
+    pthread_detach(ptid);
 }
 #endif
 
